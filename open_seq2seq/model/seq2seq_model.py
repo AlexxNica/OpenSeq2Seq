@@ -21,11 +21,17 @@ class BasicSeq2SeqWithAttention(ModelBase):
     src_vocab_size = self.model_params['src_vocab_size']
     src_emb_size = self.model_params['src_emb_size']
     with tf.variable_scope("Encoder"):
-      self._src_w = tf.get_variable(name="W_src_embedding",
+      if "proj_bottleneck" in self.model_params:
+        self._src_wb = tf.get_variable(name="W_src_emb_b", shape=[src_vocab_size, self.model_params["proj_bottleneck"]])
+        self._src_wp_layer = layers_core.Dense(src_emb_size, use_bias=False, activation=None)
+        # embedded_inputs will be [batch_size, time, src_emb_size]
+        embedded_inputs = self._src_wp_layer(tf.nn.embedding_lookup(self._src_wb, src_inputs))
+      else:
+        self._src_w = tf.get_variable(name="W_src_embedding",
                                     shape=[src_vocab_size, src_emb_size],
                                     dtype=getdtype())
-      # embedded_inputs will be [batch_size, time, src_emb_size]
-      embedded_inputs = tf.nn.embedding_lookup(self._src_w, src_inputs)
+        # embedded_inputs will be [batch_size, time, src_emb_size]
+        embedded_inputs = tf.nn.embedding_lookup(self._src_w, src_inputs)
 
       if self._encoder_type == "unidirectional":
         encoder_outputs, encoder_state = self._unidirectional_encoder(
@@ -206,7 +212,11 @@ class BasicSeq2SeqWithAttention(ModelBase):
     with tf.variable_scope("Decoder"):
       tgt_vocab_size = self.model_params['tgt_vocab_size']
       tgt_emb_size = self.model_params['tgt_emb_size']
-      self._tgt_w = tf.get_variable(name='W_tgt_embedding',
+      if "proj_bottleneck" in self.model_params:
+        self._tgt_wb = tf.get_variable(name="W_src_emb_b", shape=[tgt_vocab_size, self.model_params["proj_bottleneck"]])
+        self._tgt_wp_layer = layers_core.Dense(tgt_emb_size, use_bias=False, activation=None)
+      else:
+        self._tgt_w = tf.get_variable(name='W_tgt_embedding',
                                     shape=[tgt_vocab_size, tgt_emb_size], dtype=getdtype())
       batch_size = self.model_params['batch_size']
 
@@ -223,7 +233,27 @@ class BasicSeq2SeqWithAttention(ModelBase):
                                       else self.model_params['decoder_use_skip_connections'],
                                       wrap_to_multi_rnn=not self.model_params['attention_type'].startswith('gnmt'))
 
-      output_layer = layers_core.Dense(tgt_vocab_size, use_bias=False,
+      if "proj_bottleneck" in self.model_params:
+        class DoubleDense(tf.layers.Layer):
+          def __init__(self, dim1, dim2,
+               activity_regularizer=None,
+               trainable=True,
+               name=None,
+               **kwargs):
+            super(DoubleDense, self).__init__(trainable=trainable, name=name,
+                                        activity_regularizer=activity_regularizer,
+                                        **kwargs)
+            self._proj1 = layers_core.Dense(dim1, use_bias=False, activation=None)
+            self._proj2 = layers_core.Dense(dim2, use_bias=False, activation=None)
+
+          def call(self, inputs):
+            return self._proj2(self._proj1(inputs))
+          def _compute_output_shape(self, input_shape):
+            return self._proj2._compute_output_shape(input_shape)
+
+        output_layer = DoubleDense(self.model_params["proj_bottleneck"], tgt_vocab_size)
+      else:
+        output_layer = layers_core.Dense(tgt_vocab_size, use_bias=False,
                                        activation = out_layer_activation)
 
       def attn_decoder_custom_fn(inputs, attention):
@@ -262,7 +292,9 @@ class BasicSeq2SeqWithAttention(ModelBase):
           batch_size_tensor = tf.constant(batch_size)
           decoder = tf.contrib.seq2seq.BeamSearchDecoder(
             cell=attentive_decoder_cell,
-            embedding=self._tgt_w,
+            #embedding=self._tgt_w,
+            embedding=(lambda ids: self._tgt_wp_layer(
+              tf.nn.embedding_lookup(self._tgt_wb, ids))) if "proj_bottleneck" in self.model_params else self._tgt_w,
             start_tokens=tf.tile([GO_SYMBOL], [batch_size]),
             end_token=END_SYMBOL,
             initial_state=attentive_decoder_cell.zero_state(dtype=getdtype(),
@@ -288,7 +320,9 @@ class BasicSeq2SeqWithAttention(ModelBase):
                                                                       attention_mechanism=attention_mechanism,
                                                                       cell_input_fn=attn_decoder_custom_fn)
           helper = tf.contrib.seq2seq.GreedyEmbeddingHelper(
-            embedding=self._tgt_w,
+            #embedding=self._tgt_w,
+            embedding=(lambda ids: self._tgt_wp_layer(
+              tf.nn.embedding_lookup(self._tgt_wb, ids))) if "proj_bottleneck" in self.model_params else self._tgt_w,
             start_tokens=tf.fill([batch_size], GO_SYMBOL),
             end_token=END_SYMBOL)
           decoder = tf.contrib.seq2seq.BasicDecoder(
@@ -314,7 +348,10 @@ class BasicSeq2SeqWithAttention(ModelBase):
           attentive_decoder_cell = tf.contrib.seq2seq.AttentionWrapper(cell=decoder_cells,
                                                                        attention_mechanism=attention_mechanism,
                                                                        cell_input_fn=attn_decoder_custom_fn)
-        input_vectors = tf.nn.embedding_lookup(self._tgt_w, tgt_inputs)
+        #input_vectors = tf.nn.embedding_lookup(self._tgt_w, tgt_inputs)
+        input_vectors = self._tgt_wp_layer(
+          tf.nn.embedding_lookup(self._tgt_wb, tgt_inputs)) if "proj_bottleneck" in self.model_params else self._tgt_w
+
         helper = tf.contrib.seq2seq.TrainingHelper(
           inputs = input_vectors,
           sequence_length = tgt_lengths)
